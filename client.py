@@ -4,9 +4,26 @@ import socket
 import os
 
 # --- Конфигурация клиента ---
-SERVER_HOST = '127.0.0.1'  # Или IP-адрес сервера в сети
+SERVER_HOST = '127.0.0.1'  # IP-адрес сервера в сети
 SERVER_PORT = 12345
-CHUNK_SIZE = 8192  # Должен совпадать с размером на сервере
+CHUNK_SIZE = 65535  # Должен совпадать с размером на сервере
+
+GET = b'\x01'
+PUT = b'\x02'
+DELETE = b'\x03'
+LIST = b'\x04'
+RESPONSE = b'\x05'
+
+FileNotFound = b'\x01'
+ConnectionBreak = b'\x02'
+СhecksumError = b'\x03'
+
+FLAG_ERROR = b'\x80'
+FLAG_SIZE = b'\x40'
+FLAG_STATUS = b'\x20'
+
+STATUS_OK = b"\x80"
+STATUS_NOTOK = b"\x00"
 
 
 # --- Функции клиента ---
@@ -62,62 +79,92 @@ async def send_request(command, filename="", filepath=""):
     try:
         await loop.sock_connect(client_socket, (SERVER_HOST, SERVER_PORT))
         response = await loop.sock_recv(client_socket, 1024)
-        response = response.decode('utf-8')
-        if response == "NO":
+        if response[2:3] == STATUS_NOTOK:
             print("Клиент: Сервер отказал в подключении")
             return f"Error connecting to server"
-        request = f"{command} {filename}"
-        await loop.sock_sendall(client_socket, request.encode('utf-8'))
+        # request = f"{command} {filename}"
+        # await loop.sock_sendall(client_socket, request.encode('utf-8'))
 
         if command == "GET":
-            response = await loop.sock_recv(client_socket, 1024)
-            response = response.decode('utf-8')
+            request = GET + len(filename).to_bytes(2, "big") + filename.encode("utf-8")
+            print(request)
+            await loop.sock_sendall(client_socket, request)
 
-            if response.startswith("OK"):
-                file_size = int(response[3:].strip())  # Извлекаем размер файла
+            response = await loop.sock_recv(client_socket, 1024)
+            print(response[1:2] == FLAG_SIZE)
+            if response[:1] == RESPONSE and response[1:2] == FLAG_SIZE:
+                file_size = int.from_bytes(response[2:], 'big') # Извлекаем размер файла
                 print(f"Клиент: Получен размер файла от сервера: {file_size}")
-                await loop.sock_sendall(client_socket, "READY".encode('utf-8'))  # Отправляем подтверждение
+                await loop.sock_sendall(client_socket, RESPONSE + FLAG_STATUS + STATUS_OK)  # Отправляем подтверждение
                 success = await receive_file(loop, client_socket, filename, file_size)
                 if not success:
                     print("Клиент: Ошибка при получении файла.")
+                    await loop.sock_sendall(client_socket, RESPONSE + FLAG_STATUS + STATUS_NOTOK)
+                else:
+                    await loop.sock_sendall(client_socket, RESPONSE + FLAG_STATUS + STATUS_OK)
             else:
-                print(f"Клиент: Error: {response}")
+                if response[:1] == RESPONSE and response[1:2] == FLAG_ERROR and response[2:] == FileNotFound:
+                    print(f"Клиент: Ошибка: файл не найдет")
+                else:
+                    print(f"Клиент: Непредвиденная ошибка")
 
         elif command == "PUT":
-            file_size = os.path.getsize(filepath)
-            response = await loop.sock_recv(client_socket, 1024)
-            response = response.decode('utf-8')
-            if response == "READY":
+            request = PUT + len(filename).to_bytes(2, "big") + filename.encode("utf-8")
+            print(request)
+            await loop.sock_sendall(client_socket, request)
+            try:
+                file_size = os.path.getsize(filepath)
+
                 print(f"Клиент: Размер отправляемого файла: {file_size}")
-                await loop.sock_sendall(client_socket, str(file_size).encode('utf-8'))
+                await loop.sock_sendall(client_socket, RESPONSE + FLAG_SIZE + file_size.to_bytes(4, "big"))
 
-            response = await loop.sock_recv(client_socket, 1024)
-            response = response.decode('utf-8')
+                response = await loop.sock_recv(client_socket, 1024)
 
-            if response == "READY":
-                success = await send_file(loop, client_socket, filepath)
-                if success:
+                if response[:1] == RESPONSE and response[1:2] == FLAG_STATUS and response[2:] == STATUS_OK:
+                    await send_file(loop, client_socket, filepath)
+                    print(f"Сервер: Отправлен файл '{filename}', размер: {file_size} байт.")
                     response = await loop.sock_recv(client_socket, 1024)
-                    print(f"Клиент: {response.decode('utf-8')}")
+                    if response[:1] == RESPONSE and response[1:2] == FLAG_STATUS and response[2:] == STATUS_OK:
+                        print("Клиент: файл принят")
+                    else:
+                        print("Клиент: Ошибка принятия файла на сервере")
                 else:
-                    print("Клиент: Ошибка при отправке файла.")
-            else:
-                print(f"Клиент: Error: {response}")
+                    print(f"Клиент: Error: {response}")
+
+            except FileNotFoundError:
+                await loop.sock_sendall(client_socket, RESPONSE + FLAG_ERROR + FileNotFound)
+            except Exception as e:
+                await loop.sock_sendall(client_socket, RESPONSE + FLAG_ERROR + ConnectionBreak)
 
         elif command == "LIST":
-            response = await loop.sock_recv(client_socket, 4096)
-            response = response.decode('utf-8')
-            if response.startswith("OK"):
-                files_info = json.loads(response[3:].strip())
+            request = LIST
+            # print(request)
+            await loop.sock_sendall(client_socket, request)
+            response = await loop.sock_recv(client_socket, 8192)
+            if not(response[:1] == RESPONSE and response[1:2] == FLAG_ERROR and response[2:] == ConnectionBreak):
+                offset = 0
                 print("Клиент: Список файлов:")
-                for file_data in files_info:
-                    print(f"  Имя: {file_data['name']}, Размер: {file_data['size']} байт")
+                while response[offset:offset + 1]:
+                    filename_size = int.from_bytes(response[offset:offset + 2], byteorder='big')
+                    # print(filename_size)
+                    # print(response[offset:offset + 2])
+                    filename = response[offset + 2: offset + 2 + filename_size].decode('utf-8')
+                    # print(response[offset + 2: offset + 2 + filename_size])
+                    filesize = int.from_bytes(response[offset + 2 + filename_size:offset + 6 + filename_size], byteorder='big')
+                    # print(response[offset + 2 + filename_size:offset + 6 + filename_size])
+                    offset += offset + 6 + filename_size
+                    print(f"  Имя: {filename}, Размер: {filesize} байт")
             else:
-                print(f"Клиент: Error: {response}")
+                print("Клиент: Ошибка при передаче списка файлов")
         elif command == "DELETE":
+            request = DELETE + len(filename).to_bytes(2, "big") + filename.encode("utf-8")
+            # print(request)
+            await loop.sock_sendall(client_socket, request)
             response = await loop.sock_recv(client_socket, 1024)
             response = response.decode('utf-8')
             print(f"Клиент: {response}")
+        else:
+            print("Клиент: Команда введена неправильно или ее не существует")
 
         client_socket.close()
 
@@ -130,15 +177,16 @@ async def send_request(command, filename="", filepath=""):
 async def main():
     # --- Пример использования ---
     # 1. Получить список файлов
-    await send_request("LIST")
+    # await send_request("LIST")
 
     # 2. Получить содержимое файла
-    # await send_request("GET", "f.docx")
+    # await send_request("GET", "af.zip")
     #
     # # 3. Записать файл на сервер
-    # await send_request("PUT", "d.docx", "d.docx")  # Третьим аргументом имя файла, который будем отправлять, а не содержимое
+    # await send_request("PUT", "d.txt", "d.txt")  # Третьим аргументом имя файла, который будем отправлять, а не содержимое
 
-    await send_request("DELETE", "d.docx")
+    # await send_request("PUT", "test.txt", "test.txt")
+    # await send_request("DELETE", "d.txt")
     # # 4. Повторно получить список файлов для проверки
     await send_request("LIST")
 
